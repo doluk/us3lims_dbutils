@@ -1,9 +1,10 @@
 # Dev/staging database: schema upgrade and rollback
 
-Scope: a development or staging LIMS host (e.g. astfvm) whose instance databases
-(`uslims3_*`) carry local schema changes not on any branch of `us3_sql`. Production
-hosts keep the procedure in the top-level README (dbupgrade stage1/stage2 +
-`uslims_upgrade.php`). Nothing here changes that procedure.
+Scope: a development or staging LIMS host (e.g. astfvm: RHEL 8, MariaDB 10.3.39) whose
+instance databases (`uslims3_*`) carry local schema changes not on any branch of
+`us3_sql`. Production hosts keep the procedure in the top-level README (dbupgrade
+stage1/stage2 + `uslims_upgrade.php`). Nothing here changes that procedure, `us3_sql`
+or this repository's tools.
 
 ## Why the existing tools are not enough on a dev host
 
@@ -22,31 +23,100 @@ Hence two tools, each used for what it does well:
   the baseline, including data-carrying changes skeema cannot express
   (`people.gmpReviewer int` → `people.gmpReviewerRole enum`).
 
-## 0. Prerequisites (once)
+## 0. Installation on RHEL 8 (once)
+
+Both tools are statically linked Go binaries: no runtime dependencies, independent of
+RHEL 8's glibc. Run as root (`sudo -i`). Versions are pinned; check the release pages
+before upgrading them.
+
+### 0.1 skeema (v1.14.2)
+
+MariaDB 10.3 is supported by skeema v1 but deprecated since v1.14.0. Stay on v1.x
+for as long as the host runs 10.3; skeema v2 may drop it.
+
+RPM (installs to `/usr/bin`):
 
 ```bash
-# both are single static binaries
-curl -fsSL -o /usr/local/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64 && chmod +x /usr/local/bin/dbmate
+dnf install -y https://github.com/skeema/skeema/releases/download/v1.14.2/skeema_amd64.rpm
 ```
 
-skeema: install the Linux binary from its release page (`skeema version` to check).
-Community edition covers tables, procedures and functions; triggers and views need
-Premium (LIMS instances use neither as far as `us3.sql` goes; verify with the diff in 1.3).
-
-Credentials: reuse `dbupgrade/my.cnf` (root, mode 600). skeema reads `~/.my.cnf`-style
-files; dbmate needs a URL, built at runtime so the password never lands in a file
-under git:
+Or the tarball, if `dnf` cannot reach GitHub directly:
 
 ```bash
-export DBPW="$(sed -n 's/^password=//p' ~us3/lims/database/utils/dbupgrade/my.cnf | head -1)"
+cd /tmp && curl -fsSLO https://github.com/skeema/skeema/releases/download/v1.14.2/skeema_1.14.2_linux_amd64.tar.gz
+```
+
+```bash
+tar -xzf /tmp/skeema_1.14.2_linux_amd64.tar.gz -C /tmp skeema && install -m 0755 /tmp/skeema /usr/local/bin/skeema
+```
+
+```bash
+skeema version
+```
+
+Community edition manages tables, procedures and functions. Views, triggers and events
+are Premium-only; check the diff in 1.3 for any of these. `us3.sql` is not expected to
+define them.
+
+### 0.2 dbmate (v2.38.2)
+
+No RPM is published; install the binary:
+
+```bash
+curl -fsSL -o /usr/local/bin/dbmate https://github.com/amacneil/dbmate/releases/download/v2.38.2/dbmate-linux-amd64 && chmod 0755 /usr/local/bin/dbmate && restorecon -v /usr/local/bin/dbmate
+```
+
+```bash
+dbmate --version
+```
+
+### 0.3 Notes for RHEL 8
+
+- `/usr/local/bin` is in root's login-shell `PATH` (`sudo -i`) but not in sudo's
+  `secure_path`: `sudo dbmate ...` from a user shell fails. Use `sudo -i`, the full
+  path, or the RPM for skeema.
+- `mysqldump`/`mysql` come from the installed `mariadb` package; nothing else is needed.
+- Behind an HTTP proxy, export `https_proxy` before `curl`/`dnf`.
+
+### 0.4 Credentials and helpers
+
+Reuse `dbupgrade/my.cnf` (root, mode 600). skeema reads `~/.my.cnf`; give it one copy:
+
+```bash
+install -m 600 ~us3/lims/database/utils/dbupgrade/my.cnf ~/.my.cnf
+```
+
+dbmate needs a URL; build it at runtime so the password never lands in a file under git:
+
+```bash
+export DBPW="$(sed -n 's/^password=//p' ~/.my.cnf | head -1)"
 ```
 
 Snapshot/restore helpers used below (logical, includes routines; adequate for dev sizes):
 
 ```bash
-snap() { mysqldump --defaults-file=$HOME/.my.cnf --single-transaction --routines --triggers --events "$1" | gzip > ~/dbsnap/"$1"-$(date +%Y%m%d%H%M%S).sql.gz; }
+mkdir -p ~/dbsnap
+snap() { mysqldump --single-transaction --routines --triggers --events "$1" | gzip > ~/dbsnap/"$1"-$(date +%Y%m%d%H%M%S).sql.gz; }
 restore() { mysql -e "DROP DATABASE IF EXISTS \`$1\`; CREATE DATABASE \`$1\`" && zcat "$2" | mysql "$1"; }
 ```
+
+## Dev-only repository
+
+Migrations and the skeema target live in a separate, dev-only git repository, not in
+`us3_sql` or here. Suggested layout (cloned to e.g. `~/us3-dev-db`):
+
+```
+us3-dev-db/
+  .env.example                     # DBMATE_MIGRATIONS_DIR=./migrations, DBMATE_NO_DUMP_SCHEMA=true
+  skeema-target/                   # generated in 1.2, regenerated per us3_sql update
+  migrations/
+    20261124000000_baseline.sql
+    20261201093000_people_gmp_reviewer_role.sql
+  bin/each-instance                # loop helper, 2.3
+```
+
+The repo records which `us3_sql` commit the baseline corresponds to (in the baseline
+file's comment).
 
 ## 1. One-time baseline with skeema
 
@@ -60,33 +130,34 @@ against, plus a reviewed record of every local difference.
    cd ~us3/lims/database/sql && git checkout <target branch> && git pull --ff-only
    mysql -e 'DROP DATABASE IF EXISTS uslimsref; CREATE DATABASE uslimsref'
    mysql uslimsref < us3.sql            # loads us3_procedures.sql, us3_dispatch.sql
-   skeema init -h localhost -d ~/skeema-target --schema uslimsref
+   skeema init -h localhost -d ~/us3-dev-db/skeema-target --schema uslimsref
    ```
    (`uslims_db_schemas.php --compare` builds the same `uslimsref`.)
 3. **Inventory the drift** (read-only):
    ```bash
    skeema init -h localhost -d ~/skeema-dev --schema uslims3_<inst>
-   git diff --no-index ~/skeema-target ~/skeema-dev   # ignore the .skeema files
+   git diff --no-index ~/us3-dev-db/skeema-target ~/skeema-dev   # ignore the .skeema files
    ```
    Each hunk is one of: (a) on main, missing locally → take; (b) local experiment →
    keep, move to a dbmate migration in step 2, or drop; (c) semantic change needing
    data movement → hand-written SQL.
-4. **Data-carrying changes first, by hand.** Example:
+4. **Data-carrying changes first, by hand.** For `gmpReviewer` → `gmpReviewerRole`:
    ```sql
    ALTER TABLE people ADD COLUMN gmpReviewerRole ENUM('NONE','REVIEWER','APPROVER') NOT NULL DEFAULT 'NONE';
    UPDATE people SET gmpReviewerRole = CASE gmpReviewer WHEN 1 THEN 'REVIEWER' WHEN 2 THEN 'APPROVER' ELSE 'NONE' END;
    ```
-   (enum values and mapping: take from `us3.sql` and the code, not from this example.)
+   The integer-to-role mapping must match the code that used `gmpReviewer`; check it before
+   running (`SELECT gmpReviewer, COUNT(*) FROM people GROUP BY 1`).
    skeema would emit `DROP COLUMN gmpReviewer` + `ADD COLUMN gmpReviewerRole`; it refuses
    such unsafe changes without `--allow-unsafe`, which is the safeguard here.
 5. **Converge.** Point the target directory at the instance and apply:
    ```bash
-   skeema diff  -d ~/skeema-target  --schema uslims3_<inst>   # review the DDL
-   skeema push  -d ~/skeema-target  --schema uslims3_<inst> --allow-unsafe
-   skeema diff  -d ~/skeema-target  --schema uslims3_<inst>   # exit 0 = converged
+   cd ~/us3-dev-db/skeema-target
+   skeema diff --schema uslims3_<inst>                  # review the DDL
+   skeema push --schema uslims3_<inst> --allow-unsafe
+   skeema diff --schema uslims3_<inst>                  # exit 0 = converged
    ```
-   (`--schema` override or a per-instance `.skeema`; check the option name against your
-   skeema version.) Repeat per instance.
+   Repeat per instance.
 6. **Cross-check with the repo's own validators:** `php uslims_upgrade.php --check`
    (its `instance_schema` step must be `ok`) and `php uslims_db_schemas.php --compare --show-diffs`.
 
@@ -95,25 +166,21 @@ dbmate migrations in 2.2, which makes them reviewable and reversible.
 
 ## 2. Incremental changes with dbmate
 
-### 2.1 Layout and baseline
+### 2.1 Baseline
 
-Migrations belong next to the schema they change, i.e. in `us3_sql`:
+The baseline file is not executed on existing instances; it marks the starting point:
 
-```
-us3_sql/
-  us3.sql ...                    # unchanged, remains the fresh-install path
-  migrations/
-    20261124000000_baseline.sql  # = schema after step 1 (comment-only body, see below)
-    20261201093000_people_gmp_reviewer_role.sql
+```sql
+-- us3_sql <commit>; fresh instances load us3.sql from that commit, then dbmate up
+-- migrate:up
+-- migrate:down
 ```
 
-The baseline is not executed on existing instances; it only marks the starting point.
-Body: `-- migrate:up` / `-- migrate:down` with a comment "fresh installs load us3.sql".
-Register it in each converged instance:
+Register it in each converged instance (table definition as dbmate creates it):
 
 ```bash
-for db in $(mysql -NBe "SHOW DATABASES LIKE 'uslims3\\_%'" | grep -v uslims3_global); do
-  mysql "$db" -e "CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(128) PRIMARY KEY);
+for db in $(mysql -NBe "SHOW DATABASES LIKE 'uslims3\\_%'" | grep -v '^uslims3_global$'); do
+  mysql "$db" -e "CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY);
                   INSERT IGNORE INTO schema_migrations VALUES ('20261124000000');"
 done
 ```
@@ -139,30 +206,42 @@ Rules:
 - Stored procedures stay out of dbmate: `us3_procedures.sql` is reloaded as a whole
   (`uslims_upgrade.php` step 9 tracks it by checksum). Edit it there and reload.
 - No `DELIMITER` lines (client-only syntax).
+- MariaDB 10.3 has no `RENAME COLUMN` (10.5+); use `CHANGE COLUMN old new <full definition>`.
 
-### 2.3 Dev loop (one instance)
+### 2.3 Dev loop
 
 ```bash
+cd ~/us3-dev-db
+export DBMATE_MIGRATIONS_DIR=./migrations DBMATE_NO_DUMP_SCHEMA=true
 export DATABASE_URL="mysql://root:${DBPW}@127.0.0.1:3306/uslims3_<inst>"   # URL-encode DBPW if it has @ : / %
-export DBMATE_MIGRATIONS_DIR=./migrations                                   # dbmate default is ./db/migrations
-cd ~us3/lims/database/sql
-dbmate --no-dump-schema new people_gmp_reviewer_role   # creates migrations/<ts>_...sql
+dbmate new people_gmp_reviewer_role   # creates migrations/<ts>_people_gmp_reviewer_role.sql
 snap uslims3_<inst>
-dbmate --no-dump-schema up          # apply pending
-dbmate --no-dump-schema status
-dbmate --no-dump-schema rollback    # undo last; edit; up again
+dbmate up          # apply pending
+dbmate status
+dbmate rollback    # undo last; edit; up again
 ```
+
+Via the local socket instead of TCP: `mysql://root:${DBPW}@/uslims3_<inst>?socket=/var/lib/mysql/mysql.sock`.
 
 If `down` is wrong or the database is in a half-applied state: `restore uslims3_<inst> <snapshot>`.
 
-All instances: loop over `uslims3_%` as in 2.1 with `--url` per database.
+All instances (`bin/each-instance up`, `bin/each-instance status`):
 
-### 2.4 Keep `us3.sql` and the migrations consistent
+```bash
+#!/bin/bash
+set -euo pipefail
+for db in $(mysql -NBe "SHOW DATABASES LIKE 'uslims3\\_%'" | grep -v '^uslims3_global$'); do
+  echo "== $db"; dbmate --url "mysql://root:${DBPW}@127.0.0.1:3306/$db" "$@"
+done
+```
 
-Each `us3_sql` change edits `us3.sql` **and** adds a migration. Check (CI or before
-merge): build db A from `us3.sql`, db B from `us3.sql@baseline` + `dbmate up`, then
-`skeema diff` (or `uslims_db_schemas.php`) between them must be empty. This is the
-remaining role of skeema: drift detection.
+### 2.4 After a `us3_sql` update
+
+When `us3_sql` main gains schema changes you need on the dev host, either write them as
+a dbmate migration in the dev repo (preferred; keeps rollback), or repeat section 1
+against the new commit and record a new baseline. Check consistency: build db A from the
+new `us3.sql`, db B from the baseline commit's `us3.sql` + `dbmate up`, then
+`skeema diff` between them shows exactly your dev-only changes and nothing else.
 
 ## 3. Rollback summary
 
@@ -179,11 +258,4 @@ remaining role of skeema: drift detection.
   `dbupgrade/stage2` reimports data-only dumps after recreating from `us3.sql`; the
   ledger is then lost or rejected. On a dbmate-managed dev host, do not use stage1/stage2;
   if needed, re-register the ledger afterwards as in 2.1.
-- dbmate's `--no-dump-schema` avoids writing `db/schema.sql` (needs `mysqldump` in PATH
-  otherwise and is redundant with `us3.sql`).
-
-## Open points
-
-- MariaDB version on the dev host vs. skeema's supported range.
-- Whether `us3_sql` accepts a `migrations/` directory, or migrations live in a dev-only repo.
-- Enum values/mapping for `gmpReviewerRole` (example above is illustrative).
+- `DBMATE_NO_DUMP_SCHEMA=true` avoids writing `db/schema.sql` (redundant with `us3.sql`).
