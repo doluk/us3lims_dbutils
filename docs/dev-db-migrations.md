@@ -146,8 +146,9 @@ against, plus a reviewed record of every local difference.
    ALTER TABLE people ADD COLUMN gmpReviewerRole ENUM('NONE','REVIEWER','APPROVER') NOT NULL DEFAULT 'NONE';
    UPDATE people SET gmpReviewerRole = CASE gmpReviewer WHEN 1 THEN 'REVIEWER' WHEN 2 THEN 'APPROVER' ELSE 'NONE' END;
    ```
-   The integer-to-role mapping must match the code that used `gmpReviewer`; check it before
-   running (`SELECT gmpReviewer, COUNT(*) FROM people GROUP BY 1`).
+   Mapping: 0 = NONE, 1 = REVIEWER, 2 = APPROVER. Any other value would silently become
+   NONE; check first that none occurs (must return no rows):
+   `SELECT gmpReviewer, COUNT(*) FROM people WHERE gmpReviewer NOT IN (0,1,2) OR gmpReviewer IS NULL GROUP BY 1`.
    skeema would emit `DROP COLUMN gmpReviewer` + `ADD COLUMN gmpReviewerRole`; it refuses
    such unsafe changes without `--allow-unsafe`, which is the safeguard here.
 5. **Converge.** Point the target directory at the instance and apply:
