@@ -129,12 +129,20 @@ against, plus a reviewed record of every local difference.
    ```bash
    cd ~us3/lims/database/sql && git checkout <target branch> && git pull --ff-only
    mysql -e 'DROP DATABASE IF EXISTS uslimsref; CREATE DATABASE uslimsref'
-   mysql uslimsref < us3.sql            # loads us3_procedures.sql, us3_dispatch.sql
+   mysql uslimsref < us3.sql            # tables; loads us3_dispatch.sql
+   mysql uslimsref < us3_procedures.sql # routines: us3.sql does not load them
    skeema init -h localhost -u root --socket "$(mysql -NBe "SELECT @@socket")" -d ~/us3-dev-db/skeema-target --schema uslimsref
    ```
-   (`uslims_db_schemas.php --compare` builds the same `uslimsref`.) skeema's default
+   (`uslims_db_schemas.php --compare` builds the same `uslimsref`, also in these two steps.) skeema's default
    socket is `/tmp/mysql.sock`; RHEL 8's MariaDB uses `/var/lib/mysql/mysql.sock`, hence
    `--socket`. `init` stores it in the directory's `.skeema`, so later commands there inherit it.
+   Keep the objects the dbutils tools and dbmate add out of skeema's view, or `push` drops them:
+   ```bash
+   cat >> ~/us3-dev-db/skeema-target/.skeema <<'X'
+   ignore-table=^(_dbutils_|schema_migrations$)
+   ignore-func=^_dbutils_
+   X
+   ```
 3. **Inventory the drift** (read-only):
    ```bash
    skeema init -h localhost -u root --socket "$(mysql -NBe "SELECT @@socket")" -d ~/skeema-dev --schema uslims3_<inst>
@@ -143,7 +151,19 @@ against, plus a reviewed record of every local difference.
    Each hunk is one of: (a) on main, missing locally → take; (b) local experiment →
    keep, move to a dbmate migration in step 2, or drop; (c) semantic change needing
    data movement → hand-written SQL.
-4. **Data-carrying changes first, by hand.** For `gmpReviewer` → `gmpReviewerRole`:
+   Read tables and routines separately: files containing `CREATE TABLE` are tables, the
+   rest are procedures/functions. Lists of objects only on one side:
+   ```bash
+   cd ~/us3-dev-db/skeema-target; grep -l '^CREATE TABLE' *.sql | sort > /tmp/t.tab; grep -L '^CREATE TABLE' *.sql | sort > /tmp/t.rtn
+   cd ~/skeema-dev;               grep -l '^CREATE TABLE' *.sql | sort > /tmp/d.tab; grep -L '^CREATE TABLE' *.sql | sort > /tmp/d.rtn
+   comm -3 /tmp/t.tab /tmp/d.tab    # column 1: target only (a), column 2: Demo only (b)
+   comm -3 /tmp/t.rtn /tmp/d.rtn
+   ```
+   Changed objects present on both sides: `git diff --no-index <target file> <dev file>`.
+4. **Data-carrying changes first, by hand.** `people_audit.created_at_utc` is one: it
+   comes with a UTC conversion of existing rows, so do not let skeema add it; run
+   `php migrate_people_audit_utc.php --apply` (or `--db-host/--db-name/--db-user/--db-pass`
+   for one instance) from this repo. Then For `gmpReviewer` → `gmpReviewerRole`:
    ```sql
    ALTER TABLE people ADD COLUMN gmpReviewerRole ENUM('NONE','REVIEWER','APPROVER') NOT NULL DEFAULT 'NONE';
    UPDATE people SET gmpReviewerRole = CASE gmpReviewer WHEN 1 THEN 'REVIEWER' WHEN 2 THEN 'APPROVER' ELSE 'NONE' END;
