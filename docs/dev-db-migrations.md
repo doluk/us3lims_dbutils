@@ -136,13 +136,13 @@ against, plus a reviewed record of every local difference.
    (`uslims_db_schemas.php --compare` builds the same `uslimsref`, also in these two steps.) skeema's default
    socket is `/tmp/mysql.sock`; RHEL 8's MariaDB uses `/var/lib/mysql/mysql.sock`, hence
    `--socket`. `init` stores it in the directory's `.skeema`, so later commands there inherit it.
-   Keep the objects the dbutils tools and dbmate add out of skeema's view, or `push` drops them:
+   Keep the objects the dbutils tools and dbmate add out of skeema's view, or `push` drops them.
+   Local objects you keep (1.3) are added to these patterns too, so their data stays in place:
    ```bash
-   cat >> ~/us3-dev-db/skeema-target/.skeema <<'X'
-   ignore-table=^(_dbutils_|schema_migrations$)
-   ignore-func=^_dbutils_
-   X
+   printf 'ignore-table=^(_dbutils_.*|schema_migrations)$\nignore-proc=^$\nignore-func=^_dbutils_\n' >> ~/us3-dev-db/skeema-target/.skeema
    ```
+   A table with only an extra local column (e.g. `model.stats`) is ignored as a whole for the
+   push; its column comes back through a migration in 2.2.
 3. **Inventory the drift** (read-only):
    ```bash
    skeema init -h localhost -u root --socket "$(mysql -NBe "SELECT @@socket")" -d ~/skeema-dev --schema uslims3_<inst>
@@ -176,9 +176,10 @@ against, plus a reviewed record of every local difference.
 5. **Converge.** Point the target directory at the instance and apply:
    ```bash
    cd ~/us3-dev-db/skeema-target
-   skeema diff --schema uslims3_<inst>                  # review the DDL
-   skeema push --schema uslims3_<inst> --allow-unsafe
-   skeema diff --schema uslims3_<inst>                  # exit 0 = converged
+   sed -i 's/^schema=.*/schema=uslims3_<inst>/' .skeema   # diff/push refuse --schema on the command line
+   skeema diff                                         # review the DDL; exit 1 = differences
+   skeema push --allow-unsafe
+   skeema diff                                         # exit 0 = converged
    ```
    Repeat per instance.
 6. **Cross-check with the repo's own validators:** `php uslims_upgrade.php --check`
@@ -203,7 +204,7 @@ Register it in each converged instance (table definition as dbmate creates it):
 
 ```bash
 for db in $(mysql -NBe "SHOW DATABASES LIKE 'uslims3\\_%'" | grep -v '^uslims3_global$'); do
-  mysql "$db" -e "CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY);
+  mysql "$db" -e "CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(128) PRIMARY KEY);
                   INSERT IGNORE INTO schema_migrations VALUES ('20261124000000');"
 done
 ```
@@ -226,10 +227,50 @@ Rules:
 - MariaDB DDL commits implicitly; dbmate's transaction does not protect a half-applied
   file. Keep one logical change per file, and `snap` before `up`.
 - Write `down` so that `up; down; up` is lossless on the data you care about.
-- Stored procedures stay out of dbmate: `us3_procedures.sql` is reloaded as a whole
-  (`uslims_upgrade.php` step 9 tracks it by checksum). Edit it there and reload.
+- Release procedures stay out of dbmate: `us3_procedures.sql` is reloaded as a whole
+  (`uslims_upgrade.php` step 9 tracks it by checksum). Procedures of your own features
+  belong in that feature's migration (`CREATE OR REPLACE`, `DROP ... IF EXISTS` in down).
 - No `DELIMITER` lines (client-only syntax).
 - MariaDB 10.3 has no `RENAME COLUMN` (10.5+); use `CHANGE COLUMN old new <full definition>`.
+
+### 2.2a Kept local objects as migrations
+
+Local tables and routines kept in step 1 are already in the database (ignored by the push).
+One migration per feature, generated from the `skeema init` dump of the instance, makes them
+reproducible elsewhere; on the instance itself `up` changes nothing. `bin/mkmig`:
+
+```bash
+#!/bin/bash
+# usage: bin/mkmig <name> <object.sql>...   (files from a `skeema init` directory)
+# Tables as CREATE TABLE IF NOT EXISTS, routines as CREATE OR REPLACE without DEFINER
+# and DELIMITER; down drops the routines, then the tables.
+set -euo pipefail
+name=$1; shift
+out=migrations/$(date -u +%Y%m%d%H%M%S)_$name.sql
+{
+  echo '-- migrate:up'
+  for f in "$@"; do
+    sed -e '/^DELIMITER /d' -e 's#^END//$#END;#' \
+        -e 's/^CREATE TABLE `/CREATE TABLE IF NOT EXISTS `/' \
+        -e 's/^CREATE DEFINER=`[^`]*`@`[^`]*` \(PROCEDURE\|FUNCTION\) /CREATE OR REPLACE \1 /' "$f"
+    echo
+  done
+  echo '-- migrate:down'
+  for f in "$@"; do
+    grep -oE '^CREATE DEFINER=`[^`]*`@`[^`]*` (PROCEDURE|FUNCTION) `[^`]+`' "$f" |
+      sed -E 's/^CREATE DEFINER=\S+ (PROCEDURE|FUNCTION) (`[^`]+`)/DROP \1 IF EXISTS \2;/' || true
+  done
+  for f in "$@"; do
+    grep -oE '^CREATE TABLE `[^`]+`' "$f" | sed -E 's/^CREATE TABLE (`[^`]+`)/DROP TABLE IF EXISTS \1;/' || true
+  done
+} > "$out"
+echo "$out"
+```
+
+A kept column on a release table is written by hand:
+`ALTER TABLE model ADD COLUMN IF NOT EXISTS ...;` / `ALTER TABLE model DROP COLUMN IF EXISTS stats;`.
+Read every generated file before committing it. Tested with skeema 1.14.2, dbmate 2.38.2
+and MariaDB 10.11 (the syntax used exists since 10.1/10.3).
 
 ### 2.3 Dev loop
 
