@@ -130,12 +130,14 @@ against, plus a reviewed record of every local difference.
    cd ~us3/lims/database/sql && git checkout <target branch> && git pull --ff-only
    mysql -e 'DROP DATABASE IF EXISTS uslimsref; CREATE DATABASE uslimsref'
    mysql uslimsref < us3.sql            # loads us3_procedures.sql, us3_dispatch.sql
-   skeema init -h localhost -d ~/us3-dev-db/skeema-target --schema uslimsref
+   skeema init -h localhost -u root --socket "$(mysql -NBe "SELECT @@socket")" -d ~/us3-dev-db/skeema-target --schema uslimsref
    ```
-   (`uslims_db_schemas.php --compare` builds the same `uslimsref`.)
+   (`uslims_db_schemas.php --compare` builds the same `uslimsref`.) skeema's default
+   socket is `/tmp/mysql.sock`; RHEL 8's MariaDB uses `/var/lib/mysql/mysql.sock`, hence
+   `--socket`. `init` stores it in the directory's `.skeema`, so later commands there inherit it.
 3. **Inventory the drift** (read-only):
    ```bash
-   skeema init -h localhost -d ~/skeema-dev --schema uslims3_<inst>
+   skeema init -h localhost -u root --socket "$(mysql -NBe "SELECT @@socket")" -d ~/skeema-dev --schema uslims3_<inst>
    git diff --no-index ~/us3-dev-db/skeema-target ~/skeema-dev   # ignore the .skeema files
    ```
    Each hunk is one of: (a) on main, missing locally → take; (b) local experiment →
@@ -214,7 +216,7 @@ Rules:
 ```bash
 cd ~/us3-dev-db
 export DBMATE_MIGRATIONS_DIR=./migrations DBMATE_NO_DUMP_SCHEMA=true
-export DATABASE_URL="mysql://root:${DBPW}@127.0.0.1:3306/uslims3_<inst>"   # URL-encode DBPW if it has @ : / %
+export DATABASE_URL="mysql://root:${DBPW}@/uslims3_<inst>?socket=$(mysql -NBe "SELECT @@socket")"   # URL-encode DBPW if it has @ : / %
 dbmate new people_gmp_reviewer_role   # creates migrations/<ts>_people_gmp_reviewer_role.sql
 snap uslims3_<inst>
 dbmate up          # apply pending
@@ -222,7 +224,8 @@ dbmate status
 dbmate rollback    # undo last; edit; up again
 ```
 
-Via the local socket instead of TCP: `mysql://root:${DBPW}@/uslims3_<inst>?socket=/var/lib/mysql/mysql.sock`.
+The socket is used because MariaDB's `root` usually exists only as `root@localhost`; TCP to
+127.0.0.1 may be refused.
 
 If `down` is wrong or the database is in a half-applied state: `restore uslims3_<inst> <snapshot>`.
 
@@ -232,7 +235,7 @@ All instances (`bin/each-instance up`, `bin/each-instance status`):
 #!/bin/bash
 set -euo pipefail
 for db in $(mysql -NBe "SHOW DATABASES LIKE 'uslims3\\_%'" | grep -v '^uslims3_global$'); do
-  echo "== $db"; dbmate --url "mysql://root:${DBPW}@127.0.0.1:3306/$db" "$@"
+  echo "== $db"; dbmate --url "mysql://root:${DBPW}@/$db?socket=$(mysql -NBe "SELECT @@socket")" "$@"
 done
 ```
 
